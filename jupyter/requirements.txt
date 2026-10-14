@@ -1,0 +1,10 @@
+jupyterlab>=4.2
+ipykernel
+dlt[filesystem,parquet]>=1.4
+s3fs
+fsspec
+pyarrow>=15
+pyiceberg[s3fs,pyarrow]>=0.7
+tqdm>=4.66
+pyspark==3.5.3
+

@@ -1,0 +1,352 @@
+# ============================================================================
+# Proyecto 2 FYHBD - Lakehouse StackOverflow (Medallion Bronze/Silver/Gold)
+#
+#  CAPA              SERVICIOS
+#  ----------------  ------------------------------------------------------
+#  1. Almacenamiento MinIO + minio-init (buckets)
+#  2. Catalogo       Nessie (catalogo Iceberg)
+#  3. Procesamiento  Spark (master + worker) + Jupyter
+#  4. Orquestacion   Postgres + Airflow (init, webserver, scheduler)
+#  5. Consulta SQL   Trino (Silver) + Dremio (Gold) + dremio-init (configura Dremio)
+#
+# Levantar:  cp .env.example .env
+#   base de infraestructura:  docker compose up -d --build minio minio-init nessie jupyter
+#   stack completo (requiere carpeta ./airflow y ./trino/catalog de otras personas)
+# Red unica: red_proyecto_fyhbd (todos se hablan por nombre de servicio)
+# ============================================================================
+name: fyhbd-proyecto2
+
+# ----------------------------------------------------------------------------
+# BLOQUES REUTILIZABLES
+# ----------------------------------------------------------------------------
+x-lake-env: &lake-env                       # variables comunes del lakehouse
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  NESSIE_URI: http://nessie:19120/iceberg   # catalogo REST de Iceberg (ajustar si sus scripts usan otro)
+  ICEBERG_WAREHOUSE: s3://bucket-iceberg/
+  SCHEMA__NAMING: direct                    # dlt: conservar nombres de columna originales
+  TZ: America/Bogota
+
+x-airflow-common: &airflow-common
+  build: ./airflow
+  image: fyhbd/airflow-proyecto2:1.0
+  environment: &airflow-env
+    <<: *lake-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    #----------------------------------------------------------------------
+    SPARK_MASTER_URL: spark://spark-master:7077
+    SPARK_DRIVER_HOST: airflow-scheduler
+    EVIDENCIAS_DIR: /evidencias
+    #----------------------------------------------------------------------
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts          # bronze_ingest.py, silver_*.py, gold_*.py
+    - ./evidencias:/evidencias
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+  networks: [red_proyecto]
+
+services:
+  # ==========================================================================
+  # 1. ALMACENAMIENTO
+  # ==========================================================================
+  minio:
+    image: docker.io/sourcemation/minio:latest   # MinIO OSS (Docker Hub). quay.io/minio/minio ya no publica; aistor exige licencia.
+    container_name: minio_proyecto
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9020:9000"          # API S3    -> http://localhost:9020
+      - "9021:9001"          # Consola   -> http://localhost:9021
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_REGION: ${AWS_REGION:-us-east-1}
+    volumes:
+      - minio_data:/data
+    networks: [red_proyecto]
+
+  minio-init:                # crea los buckets una vez y termina (exited 0)
+    image: quay.io/minio/aistor/minio:latest   # incluye el cliente mc + sh (solo se usa como cliente aqui)
+    container_name: minio_init
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        for i in $$(seq 1 60); do
+          if mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD && mc ready local; then
+            break
+          fi
+          echo "[minio-init] MinIO no listo, reintento $$i..."
+          sleep 2
+        done
+        mc mb --ignore-existing local/bronze
+        mc mb --ignore-existing local/bucket-iceberg
+        echo 'buckets listos: bronze, bucket-iceberg'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    restart: "no"
+    networks: [red_proyecto]
+
+  # ==========================================================================
+  # 2. CATALOGO
+  # ==========================================================================
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.94.4
+    container_name: nessie_proyecto
+    user: "0:0"
+    ports:
+      - "19130:19120"        # API/UI -> http://localhost:19130
+    environment:
+      nessie.version.store.type: ROCKSDB
+      nessie.version.store.persist.rocks.database-path: /nessie
+      nessie.server.authentication.enabled: "false"
+      nessie.catalog.default-warehouse: warehouse
+      nessie.catalog.warehouses.warehouse.location: s3://bucket-iceberg/
+      nessie.catalog.service.s3.default-options.endpoint: http://minio:9000/
+      nessie.catalog.service.s3.default-options.path-style-access: "true"
+      nessie.catalog.service.s3.default-options.region: ${AWS_REGION:-us-east-1}
+      nessie.catalog.service.s3.default-options.access-key.name: ${MINIO_ROOT_USER}
+      nessie.catalog.service.s3.default-options.access-key.secret: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - nessie_data:/nessie
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks: [red_proyecto]
+
+  # ==========================================================================
+  # 3. PROCESAMIENTO
+  # ==========================================================================
+  spark-master:
+    build: ./spark                           # [Persona 2] imagen con jars de Iceberg + S3
+    image: fyhbd/spark-proyecto2:1.0
+    container_name: spark_master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      <<: *lake-env
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_DRIVER_HOST: spark-master        # el driver de spark-submit corre aqui; el worker lo llama de vuelta
+      EVIDENCIAS_DIR: /evidencias
+    volumes:
+      - ./scripts:/opt/spark/work-dir/scripts   # silver_transform.py (spark-submit)
+      - ./evidencias:/evidencias
+    ports:
+      - "8082:8080"          # UI master -> http://localhost:8082
+      - "7077:7077"          # cluster   -> spark://spark-master:7077
+    networks: [red_proyecto]
+
+  spark-worker:
+    build: ./spark                           # [Persona 2] misma imagen que el master
+    image: fyhbd/spark-proyecto2:1.0
+    container_name: spark_worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 3g
+    ports:
+      - "8083:8081"          # UI worker -> http://localhost:8083
+    depends_on: [spark-master]
+    networks: [red_proyecto]
+
+  jupyter:
+    build: ./jupyter
+    image: fyhbd/jupyter-proyecto2:1.0
+    container_name: jupyter_proyecto
+    working_dir: /workspace
+    ports:
+      - "8890:8888"          # JupyterLab -> http://localhost:8890 (sin token)
+    environment:
+      <<: *lake-env
+      EVIDENCIAS_DIR: /evidencias
+      SPARK_MASTER_URL: spark://spark-master:7077   # [Persona 2] notebook de Silver usa el cluster
+      SPARK_DRIVER_HOST: jupyter_proyecto           # [Persona 2] el worker llama de vuelta al driver
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./scripts:/workspace/scripts
+      - ./docs:/workspace/docs
+      - ./evidencias:/evidencias
+    command: >
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root
+      --ServerApp.token='' --ServerApp.password=''
+      --ServerApp.root_dir=/workspace
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      nessie:
+        condition: service_started
+    networks: [red_proyecto]
+
+  # ==========================================================================
+  # 4. ORQUESTACION (Airflow con LocalExecutor: sin redis/worker/triggerer)
+  # ==========================================================================
+  postgres:
+    image: postgres:13
+    container_name: postgres_airflow
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks: [red_proyecto]
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/logs /sources/dags /sources/plugins
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    volumes:
+      - .:/sources
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"          # Airflow -> http://localhost:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+      #----------------------------------------------------------------------
+      nessie:
+        condition: service_started
+      spark-master:
+        condition: service_started
+      #----------------------------------------------------------------------
+
+  # ==========================================================================
+  # 5. CONSULTA SQL
+  # ==========================================================================
+  trino:                     # consulta tablas SILVER (e2e: replicar GOLD con SQL)
+    image: trinodb/trino:467
+    container_name: trino_proyecto
+    ports:
+      - "8081:8080"          # Trino -> http://localhost:8081
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog     # contiene iceberg.properties
+    depends_on:
+      nessie:
+        condition: service_started
+    networks: [red_proyecto]
+
+  dremio:                    # consulta tablas GOLD
+    image: dremio/dremio-oss:25.2.0
+    container_name: dremio_proyecto
+    ports:
+      - "9047:9047"          # UI Dremio -> http://localhost:9047
+      - "31010:31010"        # JDBC/ODBC
+      - "45678:45678"
+    environment:
+      DREMIO_MAX_HEAP_MEMORY_SIZE_MB: 2048
+      DREMIO_MAX_DIRECT_MEMORY_SIZE_MB: 2048
+    volumes:
+      - dremio_data:/opt/dremio/data
+    depends_on:
+      nessie:
+        condition: service_started
+    networks: [red_proyecto]
+
+  dremio-init:               # [Persona 3] configura Dremio una vez y termina (exited 0)
+    build: ./jupyter         # imagen ya del proyecto; solo se usa como cliente de la API de Dremio
+    image: fyhbd/jupyter-proyecto2:1.0
+    container_name: dremio_init
+    entrypoint: ["python3", "/workspace/scripts/dremio_init.py"]
+    environment:
+      DREMIO_URL: http://dremio:9047
+      DREMIO_USER: ${DREMIO_USER:-admin}
+      DREMIO_PASS: ${DREMIO_PASS:-proyecto2fyhbd}
+      NESSIE_CATALOG_ENDPOINT: http://nessie:19120/api/v2
+      S3_ENDPOINT: minio:9000   # sin esquema; el esquema va en fs.protocol (ver scripts/dremio_init.py)
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      AWS_ROOT_PATH: ${AWS_ROOT_PATH:-/bucket-iceberg}
+      EVIDENCIAS_DIR: /evidencias
+    volumes:
+      - ./scripts:/workspace/scripts
+      - ./evidencias:/evidencias
+    depends_on:
+      dremio:
+        condition: service_started
+    restart: "no"
+    networks: [red_proyecto]
+
+# ----------------------------------------------------------------------------
+volumes:
+  minio_data:
+  nessie_data:
+  postgres_data:
+  dremio_data:
+
+networks:
+  red_proyecto:
+    name: red_proyecto_fyhbd
+    driver: bridge
+    attachable: true

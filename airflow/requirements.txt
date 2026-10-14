@@ -1,0 +1,6 @@
+dlt[filesystem,parquet]>=1.4
+s3fs
+fsspec
+pyarrow>=15
+tqdm>=4.66
+pyspark==3.5.3

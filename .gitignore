@@ -1,0 +1,19 @@
+# Secretos locales (usar .env.example y .dlt/secrets.toml.example como plantilla)
+.env
+.dlt/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs runtime de Airflow (bind mount ./logs) — ojo: evidencias/*.log SÍ se sube
+logs/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

@@ -1,0 +1,9 @@
+== DREMIO sobre GOLD (validación Persona 3) — 2026-10-13T03:14Z ==
+-- top usuarios por score (gold.user_engagement) --
+[{"user_id": 180, "num_questions": 6, "num_answers": 6, "num_posts": 12, "total_score": 676}, {"user_id": 680, "num_questions": 2, "num_answers": 4, "num_posts": 6, "total_score": 501}, {"user_id": 660, "num_questions": 3, "num_answers": 5, "num_posts": 8, "total_score": 482}]
+-- usuarios sin posts (LEFT JOIN) --
+[{"sin_posts": 56}]
+-- volumen de las 4 tablas gold --
+[{"t": "user_engagement", "n": 489}, {"t": "post_counts_by_user", "n": 433}, {"t": "top_tags", "n": 10}, {"t": "post_activity_monthly", "n": 24}]
+-- top_tags desde Dremio --
+[{"tag": "python", "num_questions": 119, "tag_rank": 1}, {"tag": "pandas", "num_questions": 115, "tag_rank": 2}, {"tag": "minio", "num_questions": 113, "tag_rank": 3}]
